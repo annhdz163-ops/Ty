@@ -1,0 +1,54 @@
+const express=require("express"),cors=require("cors"),bcrypt=require("bcryptjs"),jwt=require("jsonwebtoken"),Database=require("better-sqlite3"),path=require("path");
+const app=express(); const db=new Database(path.join(__dirname,"taskpoint.db"));
+const PORT=process.env.PORT||3000, JWT_SECRET=process.env.JWT_SECRET||"CHANGE_THIS_SECRET";
+app.use(cors()); app.use(express.json()); app.use(express.static(path.join(__dirname,"../frontend")));
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,points INTEGER NOT NULL DEFAULT 0,role TEXT NOT NULL DEFAULT 'member',status TEXT NOT NULL DEFAULT 'active',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,description TEXT NOT NULL,points INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS completions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,task_id INTEGER NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(user_id,task_id));
+CREATE TABLE IF NOT EXISTS rewards(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,cost INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS redemptions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reward_id INTEGER NOT NULL,cost INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS point_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,delta INTEGER NOT NULL,reason TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+`);
+
+if(!db.prepare("SELECT id FROM users WHERE email=?").get("admin@taskpoint.local")){
+ const hash=bcrypt.hashSync("admin123",10);
+ db.prepare("INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,'admin')").run("Admin","admin@taskpoint.local",hash);
+}
+if(db.prepare("SELECT COUNT(*) c FROM tasks").get().c===0){
+ const s=db.prepare("INSERT INTO tasks(title,description,points) VALUES(?,?,?)");
+ [["Äá»c bĂ i giá»›i thiá»‡u","Äá»c ná»™i dung giá»›i thiá»‡u.",100],["Kháº£o sĂ¡t nhanh","HoĂ n thĂ nh kháº£o sĂ¡t máº«u.",250],["Nhiá»‡m vá»¥ háº±ng ngĂ y","XĂ¡c nháº­n tham gia nhiá»‡m vá»¥.",150]].forEach(x=>s.run(...x));
+}
+if(db.prepare("SELECT COUNT(*) c FROM rewards").get().c===0){
+ const s=db.prepare("INSERT INTO rewards(name,cost) VALUES(?,?)");
+ [["Tháº» quĂ  10.000Ä‘",1000],["Tháº» quĂ  20.000Ä‘",2000],["Tháº» quĂ  50.000Ä‘",5000]].forEach(x=>s.run(...x));
+}
+
+function auth(req,res,next){try{const h=req.headers.authorization||"";if(!h.startsWith("Bearer "))return res.status(401).json({error:"Missing token"});req.user=jwt.verify(h.slice(7),JWT_SECRET);next()}catch(e){res.status(401).json({error:"Invalid token"})}}
+function admin(req,res,next){if(req.user.role!=="admin")return res.status(403).json({error:"Admin only"});next()}
+function issue(u){return jwt.sign({id:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"7d"})}
+
+app.post("/api/auth/register",(req,res)=>{const {name,email,password}=req.body;if(!name||!email||!password||password.length<6)return res.status(400).json({error:"Invalid data"});try{const hash=bcrypt.hashSync(password,10),r=db.prepare("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)").run(name,email.toLowerCase(),hash);const u=db.prepare("SELECT id,name,email,points,role,status FROM users WHERE id=?").get(r.lastInsertRowid);res.json({user:u,token:issue({...u})})}catch(e){res.status(409).json({error:"Email already exists"})}});
+app.post("/api/auth/login",(req,res)=>{const u=db.prepare("SELECT * FROM users WHERE email=?").get((req.body.email||"").toLowerCase());if(!u||!bcrypt.compareSync(req.body.password||"",u.password_hash))return res.status(401).json({error:"Invalid credentials"});if(u.status!=="active")return res.status(403).json({error:"Account locked"});res.json({user:{id:u.id,name:u.name,email:u.email,points:u.points,role:u.role,status:u.status},token:issue(u)})});
+
+app.get("/api/me",auth,(req,res)=>res.json(db.prepare("SELECT id,name,email,points,role,status,created_at FROM users WHERE id=?").get(req.user.id)));
+app.get("/api/tasks",auth,(req,res)=>res.json(db.prepare("SELECT * FROM tasks WHERE active=1 ORDER BY id DESC").all()));
+app.post("/api/tasks/:id/complete",auth,(req,res)=>{const t=db.prepare("SELECT * FROM tasks WHERE id=? AND active=1").get(req.params.id);if(!t)return res.status(404).json({error:"Task not found"});try{db.transaction(()=>{db.prepare("INSERT INTO completions(user_id,task_id) VALUES(?,?)").run(req.user.id,t.id);db.prepare("UPDATE users SET points=points+? WHERE id=?").run(t.points,req.user.id);db.prepare("INSERT INTO point_logs(user_id,delta,reason) VALUES(?,?,?)").run(req.user.id,t.points,"Complete: "+t.title)})();res.json({ok:true,points:t.points})}catch(e){res.status(409).json({error:"Task already completed"})}});
+
+app.get("/api/rewards",auth,(req,res)=>res.json(db.prepare("SELECT * FROM rewards WHERE active=1").all()));
+app.post("/api/rewards/:id/redeem",auth,(req,res)=>{const r=db.prepare("SELECT * FROM rewards WHERE id=? AND active=1").get(req.params.id);if(!r)return res.status(404).json({error:"Reward not found"});const u=db.prepare("SELECT points FROM users WHERE id=?").get(req.user.id);if(u.points<r.cost)return res.status(400).json({error:"Not enough points"});db.transaction(()=>{db.prepare("UPDATE users SET points=points-? WHERE id=?").run(r.cost,req.user.id);db.prepare("INSERT INTO redemptions(user_id,reward_id,cost) VALUES(?,?,?)").run(req.user.id,r.id,r.cost);db.prepare("INSERT INTO point_logs(user_id,delta,reason) VALUES(?,?,?)").run(req.user.id,-r.cost,"Redeem: "+r.name)})();res.json({ok:true})});
+
+app.get("/api/admin/users",auth,admin,(req,res)=>res.json(db.prepare("SELECT id,name,email,points,role,status,created_at FROM users ORDER BY id DESC").all()));
+app.patch("/api/admin/users/:id",auth,admin,(req,res)=>{const {status,role}=req.body;if(status&&!["active","locked"].includes(status))return res.status(400).json({error:"Bad status"});if(role&&!["member","admin"].includes(role))return res.status(400).json({error:"Bad role"});db.prepare("UPDATE users SET status=COALESCE(?,status),role=COALESCE(?,role) WHERE id=?").run(status||null,role||null,req.params.id);res.json({ok:true})});
+app.post("/api/admin/users/:id/points",auth,admin,(req,res)=>{const delta=Number(req.body.delta);if(!Number.isInteger(delta)||delta===0)return res.status(400).json({error:"delta must be integer"});db.transaction(()=>{db.prepare("UPDATE users SET points=MAX(0,points+?) WHERE id=?").run(delta,req.params.id);db.prepare("INSERT INTO point_logs(user_id,delta,reason) VALUES(?,?,?)").run(req.params.id,delta,"Admin adjustment")})();res.json({ok:true})});
+app.get("/api/admin/tasks",auth,admin,(req,res)=>res.json(db.prepare("SELECT * FROM tasks ORDER BY id DESC").all()));
+app.post("/api/admin/tasks",auth,admin,(req,res)=>{const {title,description,points}=req.body;if(!title||!description||!Number.isInteger(points)||points<=0)return res.status(400).json({error:"Invalid task"});const r=db.prepare("INSERT INTO tasks(title,description,points) VALUES(?,?,?)").run(title,description,points);res.json(db.prepare("SELECT * FROM tasks WHERE id=?").get(r.lastInsertRowid))});
+app.put("/api/admin/tasks/:id",auth,admin,(req,res)=>{const {title,description,points,active}=req.body;db.prepare("UPDATE tasks SET title=COALESCE(?,title),description=COALESCE(?,description),points=COALESCE(?,points),active=COALESCE(?,active) WHERE id=?").run(title||null,description||null,Number.isInteger(points)?points:null,active===undefined?null:(active?1:0),req.params.id);res.json({ok:true})});
+app.delete("/api/admin/tasks/:id",auth,admin,(req,res)=>{db.prepare("DELETE FROM tasks WHERE id=?").run(req.params.id);res.json({ok:true})});
+
+app.get("/api/admin/redemptions",auth,admin,(req,res)=>res.json(db.prepare(`SELECT r.*,u.email,re.name reward_name FROM redemptions r JOIN users u ON u.id=r.user_id JOIN rewards re ON re.id=r.reward_id ORDER BY r.id DESC`).all()));
+app.patch("/api/admin/redemptions/:id",auth,admin,(req,res)=>{if(!["pending","approved","rejected"].includes(req.body.status))return res.status(400).json({error:"Bad status"});db.prepare("UPDATE redemptions SET status=? WHERE id=?").run(req.body.status,req.params.id);res.json({ok:true})});
+
+app.post("/api/admin/tasks/import",auth,admin,(req,res)=>{const arr=Array.isArray(req.body.tasks)?req.body.tasks:[];const insert=db.prepare("INSERT INTO tasks(title,description,points) VALUES(?,?,?)");let n=0;db.transaction(()=>arr.forEach(t=>{if(t.title&&t.description&&Number.isInteger(t.points)&&t.points>0){insert.run(t.title,t.description,t.points);n++}})());res.json({created:n})});
+app.listen(PORT,()=>console.log(`TaskPoint V2 running on http://localhost:${PORT}`));
